@@ -1,5 +1,5 @@
 All:
-	gcc search.c -o exe -w
+	gcc search.c -o grepTh -w -lpthread
 
 clean :
-	rm *.o exe
+	rm grepTh

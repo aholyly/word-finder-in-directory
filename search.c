@@ -13,15 +13,41 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/param.h>
+#include <pthread.h>
+#include <signal.h>
+#include <time.h>
+
+typedef struct functionParameter_s
+{
+	FILE *log;
+	const char *string;
+	const char *fileName;
+	const char *fname;
+	int fd[5][2];
+} functionParameter;
+
+int totalFolder = 0, totalFile = 0,
+	totalFound = 0, totalLine = 0,
+	totalThread = 0;
 
 
-void readFromFile(FILE *log, const char *stringToFind, const char *fileName, const char *fname);
-void searchDirectory(FILE *log, const char *stringToFind, const char *dirName);
+void readFromFile(FILE *log, const char *stringToFind, const char *fileName, const char *fname,int fd[5][2]);
+void searchDirectory(FILE *log, const char *stringToFind, const char *dirName, int fd[5][2]);
+void *thread(void *arg);
+void signalFunc(int sig);
+int isdirectory(char *path);
 
 
 int main(int argc, const char *argv[])
 {
 	FILE *log = fopen("log.txt","a");
+	int fd[5][2];
+	clock_t begin, end;
+	double time_spent;
+
+	signal(SIGINT,signalFunc);
+
+	begin = clock();
 
 	if(argc != 3)
 	{
@@ -37,15 +63,53 @@ int main(int argc, const char *argv[])
 		return -2;
 	}
 
-	searchDirectory(log,argv[1],argv[2]);
-	fprintf(log,"\nToplam %s bulundu.\n",argv[1]);
+	if (pipe(fd[0]) == -1 || pipe(fd[1]) == -1 || pipe(fd[2]) == -1 || pipe(fd[3]) == -1)
+	{
+		perror("Failed to create the pipe");
+		return;
+	}
+
+	/*
+	fd[0] --> totalFolder
+	fd[1] --> totalFile
+	fd[2] --> totalFound
+	fd[3] --> totalLine
+	*/
+	write(fd[0][1],&totalFolder,sizeof(int));
+	write(fd[1][1],&totalFile,sizeof(int));	
+	write(fd[2][1],&totalFound,sizeof(int));	
+	write(fd[3][1],&totalLine,sizeof(int));
+
+	searchDirectory(log,argv[1],argv[2],fd);
+	
+	read(fd[0][0],&totalFolder,sizeof(int));
+	read(fd[1][0],&totalFile,sizeof(int));	
+	read(fd[2][0],&totalFound,sizeof(int));	
+	read(fd[3][0],&totalLine,sizeof(int));
+
+	totalThread = totalFile;
+	fprintf(log,"\n%d %s were found in total.\n",totalFound,argv[1]);
 
 	fclose(log);
+
+	printf("Total number of strings found : %d\n", totalFound);
+	printf("Number of directories searched: %d\n", totalFolder);
+	printf("Number of files searched: %d\n", totalFile);
+	printf("Number of lines searched: %d\n", totalLine);
+	printf("Number of cascade threads created:\n");
+	printf("Number of search threads created: %d\n", totalThread);
+	printf("Max # of threads running concurrently:\n");
+	
+	end = clock();
+	time_spent = (double)(end - begin) / CLOCKS_PER_SEC;
+
+	printf("Total run time, in milliseconds: %f\n",time_spent);
+	printf("Exit condition: Normal\n");
 
 	return 0;
 }
 
-void readFromFile(FILE *log, const char *stringToFind, const char *fileName, const char *fname)
+void readFromFile(FILE *log, const char *stringToFind, const char *fileName, const char *fname,int fd[5][2])
 {
 	FILE *fp;
 	char c;
@@ -58,11 +122,15 @@ void readFromFile(FILE *log, const char *stringToFind, const char *fileName, con
 	char *tmpStr; /* karşılaştırmak için kullanılan geçici string */
 	int isEof = 0; /* eof kontrolcüsü */
 	int strLength = 0;/* geçici stringin uzunluğu */
+	int tmpFile, tmpFound, tmpLine;
 
 	if( (fp = fopen(fileName,"r")) == NULL )
 	{
+		perror("Dosya açılamadı");
 		return;
 	}
+
+	fprintf(log, "----------------\n");
 
 	while(isEof != 1) 
 	{
@@ -99,13 +167,14 @@ void readFromFile(FILE *log, const char *stringToFind, const char *fileName, con
 			if(strLength != 0)
 				skippedCharacters++;
 		}
+		
 		/* uzunluklar eşitse */
 		if(strLength == length)
 		{
 			/* string kıyaslaması yapılır, eşitse konumlar yazılır */
 			if(strcmp(tmpStr,stringToFind) == 0)
 			{
-				fprintf(log,"%s: [%d, %d] konumunda ilk karakter bulundu.\n",fname,foundRow,foundColomn);
+				fprintf(log,"%d %lu %s: [%d, %d] konumunda ilk karakter bulundu.\n",(int)getpid(),pthread_self(),fname,foundRow,foundColomn);
 				totalCount++;
 			}
 			strLength = 0;
@@ -125,18 +194,34 @@ void readFromFile(FILE *log, const char *stringToFind, const char *fileName, con
 
 	fclose(fp);
 
+	read(fd[1][0],&tmpFile,sizeof(int));
+	read(fd[2][0],&tmpFound,sizeof(int));
+	read(fd[3][0],&tmpLine,sizeof(int));
+
+	tmpFile++;
+	tmpFound += totalCount;
+	tmpLine += rowCount;
+	
+	write(fd[1][1],&tmpFile,sizeof(int));
+	write(fd[2][1],&tmpFound,sizeof(int));
+	write(fd[3][1],&tmpLine,sizeof(int));
+
 }
 
 /*
 Referans: Ders kitabı örnek kodu
 shownames.c
 */
-void searchDirectory(FILE *log, const char *stringToFind, const char *dirName)
+void searchDirectory(FILE *log, const char *stringToFind, const char *dirName, int fd[5][2])
 {
+	int i, j, error;
 	struct dirent *direntp;
 	DIR *dirp;
-	char *nextPath;
+	char nextPath[500];
 	pid_t pid;
+	int tmpFolder;
+	pthread_t tid;
+	functionParameter param;
 
 	if ((dirp = opendir(dirName)) != NULL)
 	{
@@ -144,46 +229,64 @@ void searchDirectory(FILE *log, const char *stringToFind, const char *dirName)
 		{
 			if(strcmp(direntp->d_name,".") != 0 && strcmp(direntp->d_name,"..") != 0)
 			{
-				nextPath = (char *) malloc(strlen(dirName)+1+strlen(direntp->d_name));
-				strcpy(nextPath,dirName);strcat(nextPath,"/");strcat(nextPath,direntp->d_name);
-				printf("%s\n", nextPath);
-				if(isdirectory(nextPath) == 0)
+				sprintf(nextPath,"%s/%s", dirName, direntp->d_name);
+
+				/* FORK */
+				pid = fork();
+				if(pid == -1)
 				{
-					pid = fork();
-					if(pid == -1)
-					{
-						perror("Fork yapılamadı.");
-					}
-					if(pid == 0)
-					{
-						readFromFile(log,stringToFind,nextPath,direntp->d_name);
-						exit(0);
-					}
-					else
-						wait(NULL);
+					perror("Fork yapılamadı.");
 				}
+				/* CHILD PROCESS */
+				if(pid == 0)
+				{
+					if(isdirectory(nextPath))
+					{
+						read(fd[0][0],&tmpFolder,sizeof(int));
+						tmpFolder++;
+						write(fd[0][1],&tmpFolder,sizeof(int));
+						searchDirectory(log,stringToFind,nextPath,fd);
+					}
+					exit(0);
+				}
+				/* MAIN PROCESS */
 				else
 				{
-					pid = fork();
-					if(pid == -1)
+					wait(NULL);
+					if(isdirectory(nextPath) == 0)
 					{
-						perror("Fork yapılamadı.");
+						param.log = log;
+						param.string = stringToFind;
+						param.fileName = nextPath;
+						param.fname = direntp->d_name;
+						
+						for (i = 0; i < 4; ++i)
+						{
+							for (j = 0; j < 2; ++j)
+							{
+								param.fd[i][j] = fd[i][j];
+							}
+						}
+
+						if (error = pthread_create(&tid, NULL, thread, &param))
+							fprintf(stderr, "Failed to create thread: %s\n", strerror(error));
+
+					      if (error = pthread_join(tid, NULL))
+					         fprintf(stderr, "Failed to join thread %d: %s\n", i, strerror(error));
 					}
-					if(pid == 0)
-					{
-						searchDirectory(log,stringToFind,nextPath);
-						exit(0);
-					}
-					else
-						wait(NULL);
+					
 				}
-				free(nextPath);
 			}
-			
 		}
 		while ((closedir(dirp) == -1) && (errno == EINTR));
-
 	}
+}
+
+void *thread(void *arg)
+{
+	functionParameter *param = (functionParameter*)arg;
+
+	readFromFile(param->log,param->string,param->fileName,param->fname,param->fd);
 }
 
 /*
@@ -197,4 +300,10 @@ int isdirectory(char *path)
 		return 0;
 	else
 		return S_ISDIR(statbuf.st_mode);
+}
+
+void signalFunc(int sig)
+{
+	printf("Exit condition: CTRL - C\n");
+	exit(sig);
 }
